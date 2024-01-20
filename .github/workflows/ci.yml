@@ -1,0 +1,90 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule: [cron: "40 1 * * *"]
+
+jobs:
+
+  unit-test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: "nightly"
+            features: ""
+
+
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v2
+
+
+      - name: Setup | Toolchain
+        uses: actions-rs/toolchain@v1.0.6
+        with:
+          toolchain: "${{ matrix.toolchain }}"
+          override: true
+
+
+      - name: Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --features "${{ matrix.features }}"
+        env:
+          RUST_LOG: debug
+          RUST_BACKTRACE: full
+
+
+      # - name: Upload artifact
+      #   uses: actions/upload-artifact@v3
+      #   if: failure()
+      #   with:
+      #     name: "ut-${{ matrix.toolchain }}-${{ matrix.features }}"
+      #     path: |
+      #       xx/_log/
+      #       tests/_log/
+
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1.0.6
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - name: Format
+        uses: actions-rs/cargo@v1
+        with:
+          toolchain: nightly
+          command: fmt
+          args: --all -- --check
+
+
+      - name: clippy
+        shell: bash
+        run: |
+          cargo +nightly clippy --no-deps --workspace --all-targets                -- -D warnings
+
+
+      - name: Build-doc
+        uses: actions-rs/cargo@v1
+        with:
+          toolchain: nightly
+          command: doc
+          args: --all --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+
+      - name: Audit dependencies
+        shell: bash
+        # if: "!contains(github.event.head_commit.message, 'skip audit')"
+        run: cargo audit --db ./target/advisory-db

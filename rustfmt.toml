@@ -1,0 +1,54 @@
+# unstable_features = true
+# edition           = "2018"
+
+# fn_args_layout       = "Compressed"
+# use_small_heuristics = "Default"
+# use_try_shorthand    = true
+
+# # pre-unstable
+
+# single_line_if_else_max_width = 75
+# space_around_attr_eq          = false
+# struct_lit_width              = 50
+
+# # unstable
+
+# condense_wildcard_suffixes  = true
+# format_code_in_doc_comments = true
+# format_strings              = true
+# match_block_trailing_comma  = false
+# normalize_comments          = true
+# normalize_doc_attributes    = true
+# reorder_impl_items          = true
+# struct_lit_single_line      = true
+# use_field_init_shorthand    = true
+
+
+reorder_imports         = true
+imports_granularity     = "Item"
+group_imports           = "StdExternalCrate"
+where_single_line       = true
+trailing_comma          = "Vertical"
+overflow_delimited_expr = true
+wrap_comments           = true
+comment_width           = 100
+max_width               = 100
+fn_call_width           = 100
+attr_fn_like_width      = 100
+struct_lit_width        = 100
+struct_variant_width    = 100
+chain_width             = 100
+
+merge_derives           = false
+
+# pre-unstable
+
+
+
+
+# Allow more items to be on the same line
+#enum_variant_width = 80
+#use_small_heuristics = "Default"
+
+# Don't insert blank lines after opening brackets or before closing brackets
+#fn_single_line = true
