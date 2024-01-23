@@ -69,7 +69,7 @@ impl PartialOrd for LeaderId {
 pub struct Vote {
     pub term: u64,
     pub committed: Option<()>,
-    pub leader_id: LeaderId,
+    pub voted_for: LeaderId,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Display)]
@@ -346,7 +346,7 @@ impl Raft {
         let l = self.leading.as_mut()?;
         let v = self.sto.vote;
 
-        let is_same_leader = reply.vote.term == v.term && reply.vote.leader_id == v.leader_id;
+        let is_same_leader = reply.vote.term == v.term && reply.vote.voted_for == v.voted_for;
 
         if is_same_leader {
             assert!(l.progresses[&target].ready.is_none());
@@ -438,7 +438,7 @@ impl Raft {
             info!("N{} update_vote: {} --> {}", self.id, self.sto.vote, vote);
             self.sto.vote = vote;
 
-            if vote.leader_id != LeaderId(self.id) && self.leading.is_some() {
+            if vote.voted_for != LeaderId(self.id) && self.leading.is_some() {
                 info!("N{} Leading quit: vote:{}", self.id, self.sto.vote);
                 self.leading = None;
             }

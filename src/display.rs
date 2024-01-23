@@ -78,7 +78,7 @@ impl fmt::Display for Vote {
         } else {
             "uncommitted"
         };
-        write!(f, "T{}-{c}-{}", self.term, self.leader_id)
+        write!(f, "T{}-{c}-{}", self.term, self.voted_for)
     }
 }
 
