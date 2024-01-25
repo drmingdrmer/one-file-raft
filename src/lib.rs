@@ -1,3 +1,9 @@
+#![doc = include_str!("../README.md")]
+
+//!
+//! - Read the [Tutorial](`crate::docs::tutorial`);
+//! - Read the [Tutorial-cn](`crate::docs::tutorial_cn`);
+//!
 //! Features:
 //!
 //! - [x] Election(`Raft::elect()`)
