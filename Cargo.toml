@@ -2,7 +2,7 @@
 name = "one-file-raft"
 version = "0.1.0"
 edition = "2021"
-readme = "../README.md"
+readme = "README.md"
 authors = [
     "Zhang Yanpo <drdr.xp@gmail.com>",
 ]
