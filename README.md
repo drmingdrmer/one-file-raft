@@ -1,4 +1,4 @@
-# one_file_raft
+# one-file-raft
 
 This is a concise, demonstrative implementation of the Raft consensus algorithm
 contained within a single Rust file, approximately 300 lines in length.
