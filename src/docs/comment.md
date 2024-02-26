@@ -8,7 +8,7 @@ In the standard Raft protocol, within the same term, a vote can be cast for only
 
 Converting this logic into a `PartialOrd` relationship allows us to later abstract other conditions such as term and RPC types into the `PartialOrd` relationship and encapsulate them within the `Vote` structure. With the `PartialOrd` relationship of `Vote`, a simple comparison can determine the legitimacy of the Leader (accepting or rejecting RPC requests from a certain leader). It also concentrates correctness testing on the implementation of `PartialOrd`, rather than being dispersed throughout the codebase. We will see the powerful effect of this simplified logic later on.
 
-```rust
+```ignore
 pub struct LeaderId(pub u64);
 
 impl PartialOrd for LeaderId {
@@ -49,7 +49,7 @@ In one-file-raft, **all these logics are put into `Vote`**:
 
 Therefore, all the above updating conditions can be summarized with the definition of [Vote][] in one-file-raft:
 
-```rust
+```ignore
 #[derive(PartialOrd)]
 pub struct Vote {
     pub term: u64,
@@ -165,7 +165,7 @@ and as a writer preparing to replicate log array. This is achieved by broadcasti
 its `term` to prevent the replication of log array with a smaller `last-log-id`.
 
 
-> ```
+> ```text
 > RequestVote RPC:
 >
 > Arguments:
