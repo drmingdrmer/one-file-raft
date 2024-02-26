@@ -77,6 +77,85 @@ if vote > self.vote {
 这也体现了分布式一致性的目的就是定序的原则, `vote` 的大小顺序定义了一组事件(隶属于某个 Leader 的 log)的先后顺序.
 某种程度上也可以将 `Vote` 看做 Raft 中的虚拟时间的概念, 从 **时间** 的视角来考虑, Raft 各个环节的逻辑不再显得零散孤立, 它们都在围绕一个的中心: **如何在单调的时间上记录连续的事件**
 
+
+## Commit
+
+在任何一个 distributed consensus 中, `commit` 都是一个核心概念.
+它也是容易被忽略的一个概念, 大部分时候它并没有被严格的去描述,
+因为在单线程系统中, commit 是一个 **trivial** 的概念: 写入一个变量后, 它一定能被后续的读取者看到.
+但在分布式系统中, commit 的概念发生了变化, 写入不一定能读到, commit 的概念需要重新定义,
+分布式系统区别于单机系统的独有问题可以认为都源于 commit 概念的变化.
+
+一个值, 通过一系列步骤写入, 一定能通过一系列步骤被读出, 则它就是 committed.
+这表示 commit 是一个 write 和 read 双方必须共同遵守的一个约定.
+
+> 例如, 在一个不考虑宕机的5节点系统里,
+> 如果只考虑一次写入和读取, 那么对 write 和 read 的 commit 的约定可以是以下任意一个:
+> - write 阶段是写全部5个节点, read阶段任意读1个节点;
+> - write 阶段是任意写4个节点, read阶段任意读2个节点;
+> - write 阶段是任意写3个节点, read阶段任意读3个节点;
+> - write 阶段是任意写2个节点, read阶段任意读4个节点;
+> - write 阶段是任意写1个节点, read阶段读所有5个节点.
+
+### Raft 中 Commit 的定义
+
+在 Raft 中, commit 的概念是针对 **一组log** 定义的. 一组 log 的 commit 的 write read 协议要求:
+- 一组 log 被写入 majority(半数以上节点), 以此保证一定能被后续的读取者(Candidate) 通过访问一个 majority 看到;
+- 这组 log 如果被看到, 则一定会被 Candidate 选中作为当前系统的状态变化的日志, 而不选其他也被看见的log.
+
+> Raft consensus的单位是整个一组 log 而不是单条 log. 这是一个常见的误区,
+> Raft 和 Multi Paxos 虽然形似但却是完全不同的2个协议, Multi Paxos 没有将一组日志作为一个整体来对待.
+> 所以 Raft 跟 Classic Paxos 更相似, 应该认为还是一个单值的系统, 但这个 **单值** 是可以增长的(不能缩短).
+
+### Raft 中 Commit 的实现
+
+Commit 的第一条要求很容易达成, 只需遵循 write 和 read 的节点集合必有交集就可以.
+Raft 的大部分逻辑在如何满足第二个需要:
+
+这里提到的某一组 log **一定能被选择** 说明, 每组 log 之间存在一个 **全序关系**,
+所以每组 log 需要有一个属性来标识它的 **大小**. 而每个新的 Leader 要写入的新的一组log, 都必须最大, 
+所以 Raft 中引入一个 term 的概念来标识一组 log 的大小, 且 term 必须全局单调递增.
+以及因为每个 term 中允许写入多条log, 所以这个表示每组 log 大小的属性就是: 最后一条日志的 term 和 index, last-log-id: `(term, index)`.
+
+这样, commit 的概念就可以被分成了2个部分: 
+一方面, reader(Candidate) 看到哪组日志的 last-log-id 最大, 就选择哪组日志作为已 committed 的日志;
+另一方面, writer(Leader) 写入了有最大 last-log-id 的日志, 才认为数据已经 committed.
+
+reader 的行为体现在 leader election 时, 持有最大的 last-log-id 的 Candidate 才能被选中作为 Leader;
+
+writer 的行为在 Raft 中的体现是, 在复制任何log之前, 
+**Candidate 必须阻止其他较小 last-log-id 的数据被 commit**,
+因为如果这样的数据被提交, 而自己要写入的数据又比它大(自己有较大的 last-log-id),
+那么其他的写入的数据就不会被下一个 Candidate 选中, 导致 committed 数据丢失, 违反了 commit 的原则. 
+所以 elect 阶段 Candidate 要将 term, 复制到一个 majority,
+并以此跟其他 writer (Leader) 约定, 遇到更大的 term 就放弃写入,
+因为更大的 term 意味着较小 term 的 Leader 复制的 log, 可能不具有最大last-log-id, 无法达到一定被后续 Candidate 选中的要求.
+
+于是得出了 Raft 协议的选举过程: 当 Raft 选主时, 
+Candidate 同时作为一个 reader, 读以前已经 committed 的数据;
+同时也为后面作为 writer 复制log 做准备, 即通过广播 term 防止较小的 last-log-id 被复制.
+
+> ```
+> RequestVote RPC:
+>
+> Arguments:
+>     term         : candidate’s term
+>     candidateId  : candidate   requesting vote
+>     lastLogIndex : index of candidate’s last log entry (§5.4)
+>     lastLogTerm  : term of candidate’s last log entry (§5.4)
+>
+> Results:
+>     term         : currentTerm, for candidate to update itself
+>     voteGranted  : true means candidate received vote
+>
+> Receiver implementation:
+>     1. Reply false if term < currentTerm (§5.1)
+>     2. If votedFor is null or candidateId, and candidate’s log is at
+>        least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+> ```
+
+
 [Vote]: `crate::Vote`
+[`Leading`]: `crate::Leading`
 [docs-LeaderId]: `crate::docs::tutorial_cn#leaderid`
 [etcd-raft-handle-term]: https://github.com/etcd-io/raft/blob/4fcf99f38c20868477e01f5f5c68ef1e4377a8b1/raft.go#L1053
