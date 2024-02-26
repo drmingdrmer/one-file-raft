@@ -81,7 +81,7 @@ async fn test_raft() {
         loop {
             {
                 let mm = mtx.borrow();
-                if mm.vote.leader_id == LeaderId(id) && mm.vote.committed.is_some() {
+                if mm.vote.voted_for == LeaderId(id) && mm.vote.committed.is_some() {
                     info!("=== Leader established {}", mm.vote);
                     break;
                 }
