@@ -214,10 +214,6 @@ impl Store {
         }
     }
 
-    fn has_log_id(&self, log_id: LogId) -> bool {
-        self.get_log_id(log_id.index).map(|x| x == log_id).unwrap_or(false)
-    }
-
     fn get_log_id(&self, rel_index: u64) -> Option<LogId> {
         self.logs.get(rel_index as usize).map(|x| x.log_id)
     }
@@ -333,7 +329,7 @@ impl Raft {
         let req_last = req.logs.last().map(|x| x.log_id).unwrap_or(req.prev);
 
         if is_granted && is_upto_date {
-            let log = if self.sto.has_log_id(req.prev) {
+            let log = if self.sto.get_log_id(req.prev.index) == Some(req.prev) {
                 self.sto.append(req.logs);
                 self.commit(min(req.commit, req_last.index));
                 Ok(req_last)

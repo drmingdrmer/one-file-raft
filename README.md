@@ -13,7 +13,7 @@ log compaction and log purging.
 
 ```shell
 ./loc.sh
-     302
+     300
 ```
 
 For a production use of Raft, refer to [Openraft](https://github.com/datafuselabs/openraft)
