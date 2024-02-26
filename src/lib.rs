@@ -354,12 +354,14 @@ impl Raft {
 
         let is_same_leader = reply.vote.term == v.term && reply.vote.voted_for == v.voted_for;
 
+        // 0. Set a replication channel to `ready`, once a reply is received.
         if is_same_leader {
             assert!(l.progresses[&target].ready.is_none());
             l.progresses.get_mut(&target).unwrap().ready = Some(());
         }
 
         if reply.granted && is_same_leader {
+            // 1. Vote is granted, means that Log replication privilege is acquired.
             if v.committed.is_none() {
                 debug!("N{} is granted by: N{}", self.id, target);
                 l.granted_by.insert(target);
@@ -375,11 +377,15 @@ impl Raft {
 
             let p = l.progresses.get_mut(&target).unwrap();
 
+            // 2. Update the log replication progress
+
             *p = match reply.log {
                 Ok(acked) => Progress::new(acked, max(p.len, acked.index + 1), Some(())),
                 Err(len) => Progress::new(p.acked, min(p.len, len), Some(())),
             };
             debug!("N{} progress N{target}={}", self.id, p);
+
+            // 3. Update committed index
 
             let (noop_index, len) = l.log_index_range;
             let acked = p.acked.index;
@@ -395,6 +401,7 @@ impl Raft {
                 self.commit(log_id.index)
             }
 
+            // 4. Keep sending
             if len - 1 > acked {
                 self.send_if_idle(target, len - 1 - acked);
             }
