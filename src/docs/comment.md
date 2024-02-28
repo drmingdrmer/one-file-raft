@@ -47,7 +47,7 @@ In one-file-raft, **all these logics are put into `Vote`**:
   This is because an AppendEntries request is definitely issued by a Leader, and a Leader must have been granted by a majority, so the local `voted_for` is definitely not granted by the majority, and hence the local `voted_for` can be replaced.
   That is, when the `term` is the same, a `voted_for` approved by a majority can replace a `voted_for` that is not approved by a majority. In one-file-raft, we call information approved by majority (including the elect requests and log replication) as `committed`.
 
-Therefore, all the above updating conditions can be summarized with the definition of [Vote][] in one-file-raft:
+Therefore, all the above updating conditions can be summarized with the definition of [`Vote`][] in one-file-raft:
 
 ```ignore
 #[derive(PartialOrd)]
@@ -68,7 +68,7 @@ if vote > self.vote {
 ```
 
 In one-file-raft, the legitimacy of the Leader is processed just by: **updating `vote` to a higher value**.
-This also reflects the essential of distributed consistency, which is ordering events, where the order of `vote` defines the sequence of events(logs).
+This also reflects the essential of distributed consensus, which is ordering events, where the order of `vote` defines the sequence of events(logs).
 `Vote` can also be seen as a concept of pseudo time in Raft.
 
 
@@ -185,7 +185,170 @@ its `term` to prevent the replication of log array with a smaller `last-log-id`.
 > ```
 
 
-[Vote]: `crate::Vote`
+
+## Replication: Time and Event
+
+Raft (or other distributed consensus protocols) can be seen as consisting of two
+orthogonal and independent problems:
+
+- 1) Horizontally, it addresses how data is distributed across multiple nodes:
+  for example, how read-quorums and write-quorums are agreed upon to ensure
+  visibility between reads and writes, as well as membership changes, all of
+  which fall under this horizontal aspect.
+
+- 2) Vertically, it primarily resolves the problem of ordering events. Here, two
+  concepts are introduced: **monotonic time** and the **monotonically increasing
+  history of events** that occur over this **monotonic time**. The design of
+  Raft's `Election` and `AppendEntries` mechanisms are aimed at solving these
+  issues.
+
+As we know that **there are no consensus issue in a single-threaded environment**,
+this is because there are some fundamental assumptions present in a
+single-threaded environment that do not exist in a distributed setting.
+Raft aims to fill in these missing pieces,
+thus providing consensus in a distributed environment that are similar to those
+in a single-threaded context.
+The assumptions that exist only in a single-threaded environment include:
+
+- The **time** used by the system is monotonically increasing and does not go backward;
+- At any moment in **time**, only one **event** occurs;
+- New **events** can only take place at the current **time**, not at any past time;
+- Once an **event** has occurred, it does not disappear.
+
+These four assumptions are crucial for consensus.
+It is clear that they are obviously valid in a single-threaded environment:
+
+- **Time** is monotonically increasing: In a single-threaded environment,
+  because a wall clock is used, the monotonicity of time is an obvious
+  guarantee;
+
+- Only one **event** at any moment: Also apparent in a single-threaded context,
+  as two operations on the same variable are always sequential;
+
+- New **events** can only occur at the current time: In a single-threaded
+  environment, each write to a variable necessarily happens at the current
+  moment of the wall clock;
+
+- **Events** do not disappear: In a single-threaded environment, all operations
+  on a variable are already reflected in its final value;
+
+Because we live within the realm of the wall clock, consensus is an obvious
+outcome in a single-threaded environment.
+However, in a distributed setting like Raft, the time is virtual, and we live
+outside its virtual time.
+Raft needs to re-establish these assumptions to achieve consensus.
+
+Now let's review Raft from the perspective of **time** and **events**:
+
+- In the [Vote][docs-Vote] section, we see that `term` (the most important
+  attribute in Vote) is a globally monotonically increasing variable, which is
+  also monotonically increasing on each node;
+  It can be regarded as the concept of **virtual time** in Raft.
+
+- In the [Commit][docs-Commit] section, we observe that the state of the entire
+  system, which is represented by **log array**, is also globally
+  **monotonically increasing**, and it is **monotonically increasing** on each
+  node as well (here we can ignore the `last-log-id` rollback caused by
+  truncating logs: because the rollback is always for uncommitted logs);
+  The increase here is reflected in the fact that the `last-log-id`, which
+  determines the greatness of **log array** in Raft, is monotonically
+  increasing.
+
+
+From these two concepts, we can see that Raft (or any distributed consensus
+algorithm) is the same as that of a single-threaded system:
+Raft just **substitutes the common-sense wall clock with a well-defined
+virtual time, and define event as operation logs**:
+
+- The system's **time** (term) is monotonically increasing and does not rollback;
+
+- At any moment, there is only one **event** (a single Leader for each term) writer;
+
+- New **events** can only occur at the current **time** and not at a past
+  **time** (a Leader can only propose logs of its own term, and if an Election
+  with a larger term is completed, a Leader with a smaller term is no longer
+  allowed to commit data);
+
+- The history of **events** cannot be rolled back (committed logs cannot be
+  lost, and candidates choose the log array with the largest `last-log-id`).
+
+Raft ensures these four assumptions in a distributed environment, thereby
+providing consensus.
+
+
+### Implement Replication
+
+Based on the above abstraction, viewing Raft as a monotonic sequence of
+time+events, the replication in one-file-raft is shown as:
+
+-   The recipient of replication requests (Follower): only accepts replication
+-   requests that keep time and events monotonically increasing;
+
+    The operations of the replication request include:
+    - Updating the current time (term) to a greater value;
+    - And updating the event history (log array) to a greater value.
+
+-   The initiator of replication (Candidate/Leader): replicates its own time
+    (term) and event history (log array) to other nodes;
+
+    And only after successfully updating the system to a new **time** (term) is
+    it permitted to write new **events**(log).
+
+    Because in a distributed system, writing an event at a greater time can be
+    concurrent with writing an event at a smaller time.
+    Therefore updating the time and writing the event must be two separate
+    operations:
+    - The first step blocks the writing of events at smaller times (which is the
+      Election phase);
+    - only then can data truly be replicated(which is the AppendEntries phase).
+
+Because there is only one replication logic,
+in one-file-raft, there is only one RPC: a single `Replicate` RPC.
+When a Follower handles a `Replicate` request,
+it checks whether both the vote (term) and last-log-id are **greater than or
+equal** its own as a condition for the legitimacy of the request:
+
+```ignore
+fn handle_replicate_req(&mut self, req: Request) -> Reply {
+    let is_granted = vote > self.sto.vote;
+    let is_up_to_date = req.last_log_id >= self.sto.last();
+
+    if is_granted && is_up_to_date {
+        // ...
+    }
+}
+```
+
+For the same reasons, one-file-raft does not differentiate between Candidate and
+Leader, or RequestVote and AppendEntries.
+The initiator of replication(Candidate or Leader) simply broadcasts its local
+**time** (term) and **event history** (log array) to other nodes.
+If a replication RPC is accepted by a majority, it indicates that no more data
+can be committed at time points(smaller term) before the current time point(term),
+and the initiator can now add events of the current time (term) to the **event history**(log
+array).
+
+### Inference: Initial Commit Optimization
+
+Building on the time and events-based interpretation of Raft, another potential
+optimization emerges:
+Standard Raft could effectively **transmit logs to other nodes during the
+Candidate phase as part of the RequestVote requests**.
+
+If the other nodes deem the `RequestVote.term` to be equal to or greater than
+their own, and `RequestVote.last_log_id >= self.sto.last_log_id`, they would
+process the incoming logs from the Candidate in the same manner as they would
+for AppendEntries requests.
+
+This optimization allows Raft to complete the initial commit without waiting for
+the replication of the next blank log,
+thereby minimizing system downtime by one round-trip time (RTT) during Leader transitions.
+(Note: This optimization has not been implemented in one-file-raft yet.)
+
+
+[`Vote`]: `crate::Vote`
 [`Leading`]: `crate::Leading`
 [docs-LeaderId]: `crate::docs::tutorial#leaderid`
+[docs-Vote]: `crate::docs::tutorial#vote`
+[docs-Commit]: `crate::docs::tutorial#commit`
 [etcd-raft-handle-term]: https://github.com/etcd-io/raft/blob/4fcf99f38c20868477e01f5f5c68ef1e4377a8b1/raft.go#L1053
