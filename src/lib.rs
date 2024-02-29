@@ -12,7 +12,7 @@
 //! - [x] Write application data(`Raft::write()`)
 //! - [x] Membership store(`Store::configs`).
 //! - [x] Membership change: joint consensus.
-//! - [x] Non-async event loop model(main loop: `Raft::run()`).
+//! - [x] Event loop model(main loop: `Raft::run()`).
 //! - [x] Pseudo network simulated by mpsc channels(`Net`).
 //! - [x] Pseudo Log store simulated by in-memory store(`Store`).
 //! - [x] Raft log data is a simple `String`
