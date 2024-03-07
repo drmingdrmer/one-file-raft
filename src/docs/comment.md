@@ -346,8 +346,133 @@ thereby minimizing system downtime by one round-trip time (RTT) during Leader tr
 (Note: This optimization has not been implemented in one-file-raft yet.)
 
 
+## Replication Protocol
+
+Based on the principles outlined above, the implementation of the one-file-raft
+Replication protocol includes three parts:
+- Sending Replication Request,
+- Handling Replication Request,
+- Handling Replication Reply.
+
+### 1: Sending Replication Request
+
+In one-file-raft, the initiator of Replication does not differentiate between a
+`Candidate` and a `Leader`.
+There is only one [`Leading`][] that plays both roles of `Candidate` and `Leader`.
+Both `RequestVote` and `AppendEntries` requests are represented by a single
+[`Request`][] structure.
+All Replication Requests are initiated by the [`send_if_idle()`][] function.
+
+[`send_if_idle()`][] uses [`Progress`][] to track the replication progress of
+each target, recording:
+- `acked`: The highest log-id confirmed to have been replicated;
+- `len`: The maximum log index + 1 on the `Follower`;
+- `ready`: Whether it is currently idle (no inflight requests awaiting a response)
+
+```ignore
+struct Progress {
+    acked: LogId,
+    len:   u64,
+    ready: Option<()>,
+}
+```
+
+First, [`send_if_idle()`][] checks the current target node to see if it has
+completed the previous replication via [`Progress`][].
+If it has, a `Replicate` request is sent; otherwise, it returns immediately.
+The `ready` is a container that holds at most one token (token is a `()`).
+The token is taken out when a Replication request is made and put back upon
+receiving a reply:
+
+```ignore
+// let p: Progress
+p.ready.take()?;
+```
+
+Second, it calculates the starting position of the logs to be sent.
+
+Since in Raft, the `Leader` initially does not know the log positions of each
+Follower, a multi-round RPC binary search is used to determine the highest log
+position on the `Follower` that matches the `Leader`.
+
+The Leader maintains a range `[acked, len)` inside [`Progress`][], indicating the
+binary search range.
+Here, `acked` is the highest log-id confirmed to be consistent with the Leader,
+and `len` is the log length on the Follower. Initially, this search range is
+initialized as `[LogId::default(), <leader_log_len>)`.
+
+Note that `leader_log_len` might be less than the length of logs on the
+`Follower`.
+However, since logs that exceed the `Leader`'s logs on the `Follower` are
+definitely not committed and will eventually be deleted, there's no need to
+consider these excess logs when searching for the highest matching log-id matching.
+
+To compute the starting log position `prev`, simply take the midpoint of `[acked, len)`.
+After several repetitions, `acked` will align with `len`:
+
+```ignore
+// let p: Progress
+let prev = (p.acked.index + p.len) / 2;
+```
+
+The third step is to assemble a Replication RPC: [`Request`][].
+
+- Validation part:
+  As mentioned earlier, it includes the `Leader`'s [`Vote`][] and `last_log_id`.
+  Both values must be greater than or equal to the corresponding `Follower`'s for
+  the request to be considered valid; otherwise, it will be rejected.
+
+  ```ignore
+  let req = Request {
+      vote:        self.sto.vote,
+      last_log_id: self.sto.last(),
+      // ...
+  }
+  ```
+
+- Log data section:
+  This includes a section of logs starting from the previously calculated
+  starting point `prev`,
+
+  ```ignore
+  let req = Request {
+      // ...
+      prev: self.sto.get_log_id(prev).unwrap(),
+      logs: self.sto.read_logs(prev + 1, n),
+      // ...
+  }
+  ```
+
+- Finally, it includes the `Leader`'s commit position so that the `Follower` can
+  update its own commit position in a timely manner:
+
+  ```ignore
+  let req = Request {
+
+      // Validation section
+
+      vote:        self.sto.vote,
+      last_log_id: self.sto.last(),
+
+      // Log data section
+
+      prev:        self.sto.get_log_id(prev).unwrap(),
+      logs:        self.sto.read_logs(prev + 1, n),
+
+      commit:      self.commit,
+  };
+  ```
+
+
+
+
+
 [`Vote`]: `crate::Vote`
 [`Leading`]: `crate::Leading`
+[`Progress`]: `crate::Progress`
+[`Request`]: `crate::Request`
+[`send_if_idle()`]: `crate::Raft::send_if_idle`
+
 [docs-LeaderId]: `crate::docs::tutorial#leaderid`
 [docs-Vote]: `crate::docs::tutorial#vote`
 [docs-Commit]: `crate::docs::tutorial#commit`
