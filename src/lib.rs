@@ -321,7 +321,7 @@ impl Raft {
         Some(log_id)
     }
 
-    fn handle_replicate_req(&mut self, req: Request) -> Reply {
+    pub fn handle_replicate_req(&mut self, req: Request) -> Reply {
         let my_last = self.sto.last();
         let (is_granted, vote) = self.check_vote(req.vote);
         let is_upto_date = req.last_log_id >= my_last;
@@ -344,7 +344,7 @@ impl Raft {
         }
     }
 
-    fn handle_replicate_reply(&mut self, target: u64, reply: Reply) -> Option<Leading> {
+    pub fn handle_replicate_reply(&mut self, target: u64, reply: Reply) -> Option<Leading> {
         let l = self.leading.as_mut()?;
         let v = self.sto.vote;
 
@@ -407,7 +407,7 @@ impl Raft {
         None
     }
 
-    fn send_if_idle(&mut self, target: u64, n: u64) -> Option<()> {
+    pub fn send_if_idle(&mut self, target: u64, n: u64) -> Option<()> {
         let l = self.leading.as_mut().unwrap();
 
         let p = l.progresses.get_mut(&target).unwrap();
