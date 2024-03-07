@@ -113,25 +113,25 @@ Commit 的第一条要求很容易达成, 只需遵循 write 和 read 的节点�
 Raft 的大部分逻辑在如何满足第二个需要:
 
 这里提到的某一组 log **一定能被选择** 说明, 每组 log 之间存在一个 **全序关系**,
-所以每组 log 需要有一个属性来标识它的 **大小**. 而每个新的 Leader 要写入的新的一组log, 都必须最大, 
+所以每组 log 需要有一个属性来标识它的 **大小**. 而每个新的 Leader 要写入的新的一组log, 都必须最大,
 所以 Raft 中引入一个 term 的概念来标识一组 log 的大小, 且 term 必须全局单调递增.
 以及因为每个 term 中允许写入多条log, 所以这个表示每组 log 大小的属性就是: 最后一条日志的 term 和 index, last-log-id: `(term, index)`.
 
-这样, commit 的概念就可以被分成了2个部分: 
+这样, commit 的概念就可以被分成了2个部分:
 一方面, reader(Candidate) 看到哪组日志的 last-log-id 最大, 就选择哪组日志作为已 committed 的日志;
 另一方面, writer(Leader) 写入了有最大 last-log-id 的日志, 才认为数据已经 committed.
 
 reader 的行为体现在 leader election 时, 持有最大的 last-log-id 的 Candidate 才能被选中作为 Leader;
 
-writer 的行为在 Raft 中的体现是, 在复制任何log之前, 
+writer 的行为在 Raft 中的体现是, 在复制任何log之前,
 **Candidate 必须阻止其他较小 last-log-id 的数据被 commit**,
 因为如果这样的数据被提交, 而自己要写入的数据又比它大(自己有较大的 last-log-id),
-那么其他的写入的数据就不会被下一个 Candidate 选中, 导致 committed 数据丢失, 违反了 commit 的原则. 
+那么其他的写入的数据就不会被下一个 Candidate 选中, 导致 committed 数据丢失, 违反了 commit 的原则.
 所以 elect 阶段 Candidate 要将 term, 复制到一个 majority,
 并以此跟其他 writer (Leader) 约定, 遇到更大的 term 就放弃写入,
 因为更大的 term 意味着较小 term 的 Leader 复制的 log, 可能不具有最大last-log-id, 无法达到一定被后续 Candidate 选中的要求.
 
-于是得出了 Raft 协议的选举过程: 当 Raft 选主时, 
+于是得出了 Raft 协议的选举过程: 当 Raft 选主时,
 Candidate 同时作为一个 reader, 读以前已经 committed 的数据;
 同时也为后面作为 writer 复制log 做准备, 即通过广播 term 防止较小的 last-log-id 被复制.
 
@@ -238,7 +238,7 @@ Raft 在分布式环境保证了这4个假设, 所以在分布式环境中就提
     然后才能真正复制数据, 也就是 AppendEntries 阶段.
 
 
-因为复制的逻辑只有一个, 
+因为复制的逻辑只有一个,
 所以在 one-file-raft 中, 只需一个 `Replicate` RPC, Follower 处理 `Replicate` 请求时,
 检查 vote(term) 和 last-log-id 是否都 **不小于自己的**, 以作为请求合法的条件:
 
@@ -270,9 +270,118 @@ fn handle_replicate_req(&mut self, req: Request) -> Reply {
 (这个优化在 one-file-raft 里还没有实现)
 
 
+## Replication Protocol
+
+基于以上原理, one-file-raft 的 Replication 协议的实现如下,
+包括三部分:
+- Sending Replication Request,
+- Handling Replication Request,
+- Handling Replication Reply.
+
+### 1: Sending Replication Request
+
+因为 one-file-raft 中 Replication 的发起者不区分 Candidate 和 Leader,
+只有一个 [`Leading`][] 结构, RequestVote 和 AppendEntries 请求也只由一个
+[`Request`][] 负责.  所有的 Replication Request 都是由 [`send_if_idle()`][] 函数发起的.
+
+[`send_if_idle()`][] 用一个 [`Progress`][] 结构追踪每个 Replication target 的进度状态,
+它记录了:
+- `acked`: 已确认完成复制的最大的 log-id;
+- `len`: Follower 本地最大 log index + 1;
+- `ready`: 现在是否空闲(没有已发出但没收到应答的请求)
+
+```ignore
+struct Progress {
+    acked: LogId,
+    len:   u64,
+    ready: Option<()>,
+}
+```
+
+第一步, [`send_if_idle()`][] 先通过 [`Progress`][]
+检查当前要发送的目标节点是否已完成了上一次的复制,
+如果是则发出一个 `Replicate` 请求, 否则直接返回.
+这里的 `ready` 是一个存储至多一个 token(`()`) 的容器, 每次出 Replication 请求时把这个 token 拿走, 应答收到后再将它放回去:
+
+```ignore
+// let p: Progress
+p.ready.take()?;
+```
+
+第二步, 计算发出的日志的开始位置.
+
+因为在 Raft 中, 最初 Leader 不知道每个 Follower 的 log 位置,
+所以这里用一个多轮RPC 的 binary search 来确定 Follower 上跟 Leader 匹配的最大 log 的位置.
+
+Leader 在 [`Progress`][] 里维护一个范围 `[acked, len)`, 表示 binary search 的查找范围:
+其中 `acked` 是对应 Follower 已经确认的, 和 Leader 一致的最大 log-id,
+`len` 是 Follower 上的日志长度, 最开始这个查找范围被初始化为: `[LogId::default(), <leader_log_len>)`.
+
+注意这里 `leader_log_len` 有可能是小于 Follower 的 log 的长度的,
+但因为当一个 Leader 选出后, Follower 上多出的 log, 一定是没有 committed, 最终是一定会被删掉的,
+所以 Follower 上跟 Leader 匹配的最大 log-id 一定不在这个超出的范围, 不需要考虑这部分多出来的 log.
+
+计算发送 log 的开始位置 `prev`: 直接取 `[acked, len)` 的中点, 重复几次后 acked 就跟 len 对齐了:
+
+```ignore
+// let p: Progress
+let prev = (p.acked.index + p.len) / 2;
+```
+
+第三步是组装一个 Replication 的 RPC: [`Request`][].
+
+- 验证部分:
+  如前面所述, 它包括 Leader 的 [`Vote`][] 和 `last_log_id`,
+  这2个值都要大于等于对应 Follower 的, 才认为是合法请求, 否则会被拒绝.
+
+  ```ignore
+  let req = Request {
+      vote:        self.sto.vote,
+      last_log_id: self.sto.last(),
+      // ...
+  }
+  ```
+
+- log部分:
+  它包括从上面计算的起始点位置 `prev` 开始的一段 log,
+
+  ```ignore
+  let req = Request {
+      // ...
+      prev: self.sto.get_log_id(prev).unwrap(),
+      logs: self.sto.read_logs(prev + 1, n),
+      // ...
+  }
+  ```
+
+- 最后带上 Leader 的 commit 位置, 以便 Follower 可以及时的更新自己的 commit 位置:
+
+  ```ignore
+  let req = Request {
+
+      // Validation section
+
+      vote:        self.sto.vote,
+      last_log_id: self.sto.last(),
+
+      // Log data section
+
+      prev:        self.sto.get_log_id(prev).unwrap(),
+      logs:        self.sto.read_logs(prev + 1, n),
+
+      commit:      self.commit,
+  };
+  ```
+
+
+
 
 [`Vote`]: `crate::Vote`
 [`Leading`]: `crate::Leading`
+[`Progress`]: `crate::Progress`
+[`Request`]: `crate::Request`
+[`send_if_idle()`]: `crate::Raft::send_if_idle`
+
 [docs-LeaderId]: `crate::docs::tutorial_cn#leaderid`
 [docs-Vote]: `crate::docs::tutorial_cn#vote`
 [docs-Commit]: `crate::docs::tutorial_cn#commit`
