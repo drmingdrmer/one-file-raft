@@ -376,71 +376,7 @@ let prev = (p.acked.index + p.len) / 2;
 
 ### 2: Handle Replication Request
 
-one-file-raft 中的 Follower 处理 Replication 请求的逻辑包括2步:
-
-- 首先验证请求的合法性, 如果不合法直接返回 Reject;
-- 然后更新自己的时间和事件历史, 并回复 OK.
-
-上面我们提到, 一个来自 Leader 的 Replication 请求的合法性取决于:
-它的 `vote`(term) 和 `last_log_id` 都要大于等于 Follower 的对应值.
-或者更直观的理解为, Leader 具有较大的 **时间** 且有较新的 **事件** 历史.
-
-标准 Raft 中请求合法性检查要区分 RPC 类型:
-
-- 对 RequestVote 请求:
-  节点自己的当前 `voted_for` 为空, 才能接受请求;
-- 对 AppendEntries 请求:
-  节点自己的当前 `voted_for` 不为空, 也可以接受请求;
-
-one-file-raft 相比之, 验证简化成了2个简单的比较,
-最终 Replication 请求的处理整体结构如下([`handle_replicate_req()`][]):
-
-```rust,ignore
-fn handle_replicate_req(&mut self, req: Request) -> Reply {
-
-    let is_granted   = vote > self.sto.vote;
-    let is_upto_date = req.last_log_id >= self.sto.last();
-
-    if is_granted && is_upto_date {
-        // ... to be continued below ...
-```
-
-如果 Replication 请求验证通过, 则把节点本地的 **时间** 和 **事件** 历史更新为请求中的值,
-其中时间更新是直接赋值, 事件历史更新是追加请求中的日志.
-跟标准的 Raft 一样, 确认请求中的日志跟本地是连续的之后, 才能追加:
-如果跟 Leader 发来的日志不一致, 则说明本地日志一定是 **未提交的**, 需要删除,
-等待 Leader 下次 Replication.
-
-```rust,ignore
-    if is_granted && is_upto_date {
-        // ... continued below ...
-        if self.sto.get_log_id(req.prev.index) == Some(req.prev) {
-            self.sto.append(req.logs);
-        } else {
-            self.sto.truncate(req.prev);
-        };
-    }
-}
-```
-
-最后, Follower 回复 Replication 请求处理的结果 `struct Reply`:
-
-- 其中 `granted` 表示请求是否被认为是合法的, 也就是验证 Leader 的时间(`vote`)和事件历史(`log`);
-- `vote` 表示 Follower 自己的时间;
-- `log` 表示 Follower 将请求中的 log 写到本地后的结果.
-    - 其中`Ok(LogId)` 表示成功接受了log, 并返回了已知的跟 Leader 对齐的最大log id.
-    - 而 `Err(u64)` 表示日志不连续无法接受, 并返回了 Follower 自己的最大log index+1, 告知 Leader 只需要在这个位置之前进行二分查找.
-
-```rust,ignore
-pub struct Reply {
-    granted: bool,
-    vote:    Vote,
-    log:     Result<LogId, u64>,
-}
-```
-
 one-file-raft 中所有处理 RPC 请求的代码仅以下17行 ([`handle_replicate_req()`][]):
-
 
 ```rust,ignore
 pub fn handle_replicate_req(&mut self, req: Request) -> Reply {
@@ -467,7 +403,74 @@ pub fn handle_replicate_req(&mut self, req: Request) -> Reply {
 }
 ```
 
+Follower 处理 Replication 请求的逻辑包括2步:
 
+- 首先验证请求的合法性, 如果不合法直接返回 Reject;
+- 然后更新自己的时间和事件历史, 并回复 OK.
+
+上面我们提到, 一个来自 Leader 的 Replication 请求的合法性取决于:
+它的 `vote`(term) 和 `last_log_id` 都要大于等于 Follower 的对应值.
+或者更直观的理解为, Leader 具有较大的 **时间** 且有较新的 **事件** 历史.
+
+标准 Raft 中请求合法性检查要区分 RPC 类型:
+
+- 对 `RequestVote` 请求:
+  节点自己的当前 `voted_for` 为空, 才能接受请求;
+- 对 `AppendEntries` 请求:
+  节点自己的当前 `voted_for` 不为空, 也可以接受请求;
+
+one-file-raft 相比之, 验证简化成了2个简单的比较,
+最终 Replication 请求的处理整体结构如下([`handle_replicate_req()`][]):
+
+```rust,ignore
+fn handle_replicate_req(&mut self, req: Request) -> Reply {
+
+    let is_granted   = vote > self.sto.vote;
+    let is_upto_date = req.last_log_id >= self.sto.last();
+
+    if is_granted && is_upto_date {
+        // ... to be continued below ...
+    }
+}
+```
+
+如果 Replication 请求验证通过, 则把节点本地的 **时间** 和 **事件** 历史更新为请求中的值,
+其中时间更新是直接赋值, 事件历史更新是追加请求中的日志.
+跟标准的 Raft 一样, 确认请求中的日志跟本地是连续的之后, 才能追加:
+如果跟 Leader 发来的日志不一致, 则说明本地日志一定是 **未提交的**, 需要删除,
+等待 Leader 下次 Replication.
+
+```rust,ignore
+{
+    if is_granted && is_upto_date {
+        // ... continued below ...
+        if self.sto.get_log_id(req.prev.index) == Some(req.prev) {
+            self.sto.append(req.logs);
+        } else {
+            self.sto.truncate(req.prev);
+        };
+    }
+}
+```
+
+最后, Follower 回复 Replication 请求处理的结果 `struct Reply`:
+
+- 其中 `granted` 表示请求是否被认为是合法的, 也就是验证 Leader
+  的时间(`vote`)和事件历史(`log`);
+- `vote` 表示 Follower 自己的时间;
+- `log` 表示 Follower 将请求中的 log 写到本地后的结果.
+    - 其中`Ok(LogId)` 表示成功接受了log, 并返回了已知的跟 Leader 对齐的最大log
+      id.
+    - 而 `Err(u64)` 表示日志不连续无法接受, 并返回了 Follower 自己的最大log
+      index+1, 告知 Leader 只需要在这个位置之前进行二分查找.
+
+```rust,ignore
+pub struct Reply {
+    granted: bool,
+    vote:    Vote,
+    log:     Result<LogId, u64>,
+}
+```
 
 
 [`Vote`]: `crate::Vote`

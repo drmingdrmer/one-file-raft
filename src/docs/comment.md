@@ -8,7 +8,7 @@ In the standard Raft protocol, within the same term, a vote can be cast for only
 
 Converting this logic into a `PartialOrd` relationship allows us to later abstract other conditions such as term and RPC types into the `PartialOrd` relationship and encapsulate them within the `Vote` structure. With the `PartialOrd` relationship of `Vote`, a simple comparison can determine the legitimacy of the Leader (accepting or rejecting RPC requests from a certain leader). It also concentrates correctness testing on the implementation of `PartialOrd`, rather than being dispersed throughout the codebase. We will see the powerful effect of this simplified logic later on.
 
-```ignore
+```rust,ignore
 pub struct LeaderId(pub u64);
 
 impl PartialOrd for LeaderId {
@@ -49,7 +49,7 @@ In one-file-raft, **all these logics are put into `Vote`**:
 
 Therefore, all the above updating conditions can be summarized with the definition of [`Vote`][] in one-file-raft:
 
-```ignore
+```rust,ignore
 #[derive(PartialOrd)]
 pub struct Vote {
     pub term: u64,
@@ -308,7 +308,7 @@ When a Follower handles a `Replicate` request,
 it checks whether both the vote (term) and last-log-id are **greater than or
 equal** its own as a condition for the legitimacy of the request:
 
-```ignore
+```rust,ignore
 fn handle_replicate_req(&mut self, req: Request) -> Reply {
     let is_granted = vote > self.sto.vote;
     let is_up_to_date = req.last_log_id >= self.sto.last();
@@ -369,7 +369,7 @@ each target, recording:
 - `len`: The maximum log index + 1 on the `Follower`;
 - `ready`: Whether it is currently idle (no inflight requests awaiting a response)
 
-```ignore
+```rust,ignore
 struct Progress {
     acked: LogId,
     len:   u64,
@@ -384,7 +384,7 @@ The `ready` is a container that holds at most one token (token is a `()`).
 The token is taken out when a Replication request is made and put back upon
 receiving a reply:
 
-```ignore
+```rust,ignore
 // let p: Progress
 p.ready.take()?;
 ```
@@ -410,7 +410,7 @@ consider these excess logs when searching for the highest matching log-id matchi
 To compute the starting log position `prev`, simply take the midpoint of `[acked, len)`.
 After several repetitions, `acked` will align with `len`:
 
-```ignore
+```rust,ignore
 // let p: Progress
 let prev = (p.acked.index + p.len) / 2;
 ```
@@ -422,7 +422,7 @@ The third step is to assemble a Replication RPC: [`Request`][].
   Both values must be greater than or equal to the corresponding `Follower`'s for
   the request to be considered valid; otherwise, it will be rejected.
 
-  ```ignore
+  ```rust,ignore
   let req = Request {
       vote:        self.sto.vote,
       last_log_id: self.sto.last(),
@@ -434,7 +434,7 @@ The third step is to assemble a Replication RPC: [`Request`][].
   This includes a section of logs starting from the previously calculated
   starting point `prev`,
 
-  ```ignore
+  ```rust,ignore
   let req = Request {
       // ...
       prev: self.sto.get_log_id(prev).unwrap(),
@@ -446,7 +446,7 @@ The third step is to assemble a Replication RPC: [`Request`][].
 - Finally, it includes the `Leader`'s commit position so that the `Follower` can
   update its own commit position in a timely manner:
 
-  ```ignore
+  ```rust,ignore
   let req = Request {
 
       // Validation section
@@ -464,7 +464,118 @@ The third step is to assemble a Replication RPC: [`Request`][].
   ```
 
 
+### 2: Handle Replication Request
 
+All of the RPC request handling code in one-file-raft is contained within the
+following succinct 17 lines ([`handle_replicate_req()`][]):
+
+```rust,ignore
+pub fn handle_replicate_req(&mut self, req: Request) -> Reply {
+    let my_last = self.sto.last();
+    let (is_granted, vote) = self.check_vote(req.vote);
+    let is_upto_date = req.last_log_id >= my_last;
+
+    let req_last = req.logs.last().map(|x| x.log_id).unwrap_or(req.prev);
+
+    if is_granted && is_upto_date {
+        let log = if self.sto.get_log_id(req.prev.index) == Some(req.prev) {
+            self.sto.append(req.logs);
+            self.commit(min(req.commit, req_last.index));
+            Ok(req_last)
+        } else {
+            self.sto.truncate(req.prev);
+            Err(req.prev.index)
+        };
+
+        Reply { granted: true, vote, log }
+    } else {
+        Reply { granted: false, vote, log: Err(my_last.index + 1) }
+    }
+}
+```
+
+A Follower processes Replication requests in two main steps:
+
+- First, it validates the request. If the request is invalid, it
+  immediately responds with a Reject.
+- Next, if the request is valid, the Follower updates its own **time** and
+  **event** history, then responds with an OK.
+
+As previously mentioned, the validity of a Replication request from a Leader
+hinges on two factors: its `vote` (or term) and `last_log_id` must be at least
+equal to those of the Follower.
+Put simply, the Leader must be on the same or a more recent **time**, and it
+must possess a more up-to-date **event** history.
+
+Standard Raft differentiates the validity checks based on the type of RPC:
+
+- For `RequestVote` requests:
+  A node can accept the request only if its current `voted_for` is null,
+  indicating it hasn't voted yet.
+- For `AppendEntries` requests:
+  A node can accept the request even if its `voted_for` is **NOT** null, indicating
+  it has already voted.
+
+By contrast, one-file-raft streamlines this process into two straightforward
+comparisons.
+The overall structure of Replication request handling looks like this
+([`handle_replicate_req()`][]):
+
+```rust,ignore
+fn handle_replicate_req(&mut self, req: Request) -> Reply {
+
+    let is_granted   = vote > self.sto.vote;
+    let is_upto_date = req.last_log_id >= self.sto.last();
+
+    if is_granted && is_upto_date {
+        // ... to be continued below ...
+    }
+}
+```
+
+
+If the Replication request is validated, the Follower updates its local
+**time** and **event** history to reflect the values in the request.
+- The **time**(`vote`) is updated via a direct assignment,
+- while the **event** history is appended with the logs included in the request.
+
+Similar to standard Raft, the Follower appends the new logs only after ensuring
+there's continuity with its existing logs: if there's a mismatch with the
+Leader's logs, the local logs must be **uncommitted** and are thus truncated, in
+anticipation of the Leader's subsequent Replication efforts.
+
+```rust,ignore
+{
+    if is_granted && is_upto_date {
+        // ... continued below ...
+        if self.sto.get_log_id(req.prev.index) == Some(req.prev) {
+            self.sto.append(req.logs);
+        } else {
+            self.sto.truncate(req.prev);
+        };
+    }
+}
+```
+
+Finally, the Follower sends a `struct Reply` to report the outcome of the Replication request:
+
+- `granted` indicates the request's validity, effectively verifying the
+  Leader's time (`vote`) and event history (`log`).
+- `vote` represents the Follower's current **time**.
+- `log` reflects the result of writing the request's logs to the Follower's local storage.
+    - `Ok(LogId)` indicates successful acceptance of the log and returns the
+      largest known log id aligned with the Leader.
+    - `Err(u64)` indicates the logs are not continuous and cannot be accepted,
+      returning the Follower's own largest log index + 1, informing the Leader
+      that a binary search is only needed before this position.
+
+```rust,ignore
+pub struct Reply {
+    granted: bool,
+    vote:    Vote,
+    log:     Result<LogId, u64>,
+}
+```
 
 
 [`Vote`]: `crate::Vote`
@@ -472,6 +583,7 @@ The third step is to assemble a Replication RPC: [`Request`][].
 [`Progress`]: `crate::Progress`
 [`Request`]: `crate::Request`
 [`send_if_idle()`]: `crate::Raft::send_if_idle`
+[`handle_replicate_req()`]: `crate::Raft::handle_replicate_req`
 
 [docs-LeaderId]: `crate::docs::tutorial#leaderid`
 [docs-Vote]: `crate::docs::tutorial#vote`
