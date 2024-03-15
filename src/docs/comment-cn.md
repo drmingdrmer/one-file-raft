@@ -13,7 +13,7 @@
 通过 `Vote` 的 `PartialOrd` 关系, 一个简单的大小比较就可以判断所有涉及 Leader 合法性的代码（接受或拒绝来自某领导者的 RPC 请求）。
 这样也能将正确性测试集中于 `PartialOrd` 的实现上，而非分散在代码库的不同位置。我们将在后面看到这种简化逻辑的强大作用。
 
-```ignore
+```rust,ignore
 pub struct LeaderId(pub u64);
 
 impl PartialOrd for LeaderId {
@@ -55,7 +55,7 @@ one-file-raft 中为了减少 ~代码行数~ 思维负担, **对这些逻辑都�
 
 因此, 上面所有的更新条件都可以归结为 one-file-raft 中的 [`Vote`][] 定义:
 
-```ignore
+```rust,ignore
 #[derive(PartialOrd)]
 pub struct Vote {
     pub term: u64,
@@ -242,7 +242,7 @@ Raft 在分布式环境保证了这4个假设, 所以在分布式环境中就提
 所以在 one-file-raft 中, 只需一个 `Replicate` RPC, Follower 处理 `Replicate` 请求时,
 检查 vote(term) 和 last-log-id 是否都 **不小于自己的**, 以作为请求合法的条件:
 
-```ignore
+```rust,ignore
 fn handle_replicate_req(&mut self, req: Request) -> Reply {
     let is_granted = vote > self.sto.vote;
     let is_upto_date = req.last_log_id >= self.sto.last();
@@ -290,7 +290,7 @@ fn handle_replicate_req(&mut self, req: Request) -> Reply {
 - `len`: Follower 本地最大 log index + 1;
 - `ready`: 现在是否空闲(没有已发出但没收到应答的请求)
 
-```ignore
+```rust,ignore
 struct Progress {
     acked: LogId,
     len:   u64,
@@ -303,7 +303,7 @@ struct Progress {
 如果是则发出一个 `Replicate` 请求, 否则直接返回.
 这里的 `ready` 是一个存储至多一个 token(`()`) 的容器, 每次出 Replication 请求时把这个 token 拿走, 应答收到后再将它放回去:
 
-```ignore
+```rust,ignore
 // let p: Progress
 p.ready.take()?;
 ```
@@ -323,7 +323,7 @@ Leader 在 [`Progress`][] 里维护一个范围 `[acked, len)`, 表示 binary se
 
 计算发送 log 的开始位置 `prev`: 直接取 `[acked, len)` 的中点, 重复几次后 acked 就跟 len 对齐了:
 
-```ignore
+```rust,ignore
 // let p: Progress
 let prev = (p.acked.index + p.len) / 2;
 ```
@@ -334,7 +334,7 @@ let prev = (p.acked.index + p.len) / 2;
   如前面所述, 它包括 Leader 的 [`Vote`][] 和 `last_log_id`,
   这2个值都要大于等于对应 Follower 的, 才认为是合法请求, 否则会被拒绝.
 
-  ```ignore
+  ```rust,ignore
   let req = Request {
       vote:        self.sto.vote,
       last_log_id: self.sto.last(),
@@ -345,7 +345,7 @@ let prev = (p.acked.index + p.len) / 2;
 - log部分:
   它包括从上面计算的起始点位置 `prev` 开始的一段 log,
 
-  ```ignore
+  ```rust,ignore
   let req = Request {
       // ...
       prev: self.sto.get_log_id(prev).unwrap(),
@@ -356,7 +356,7 @@ let prev = (p.acked.index + p.len) / 2;
 
 - 最后带上 Leader 的 commit 位置, 以便 Follower 可以及时的更新自己的 commit 位置:
 
-  ```ignore
+  ```rust,ignore
   let req = Request {
 
       // Validation section
@@ -374,6 +374,100 @@ let prev = (p.acked.index + p.len) / 2;
   ```
 
 
+### 2: Handle Replication Request
+
+one-file-raft 中的 Follower 处理 Replication 请求的逻辑包括2步:
+
+- 首先验证请求的合法性, 如果不合法直接返回 Reject;
+- 然后更新自己的时间和事件历史, 并回复 OK.
+
+上面我们提到, 一个来自 Leader 的 Replication 请求的合法性取决于:
+它的 `vote`(term) 和 `last_log_id` 都要大于等于 Follower 的对应值.
+或者更直观的理解为, Leader 具有较大的 **时间** 且有较新的 **事件** 历史.
+
+标准 Raft 中请求合法性检查要区分 RPC 类型:
+
+- 对 RequestVote 请求:
+  节点自己的当前 `voted_for` 为空, 才能接受请求;
+- 对 AppendEntries 请求:
+  节点自己的当前 `voted_for` 不为空, 也可以接受请求;
+
+one-file-raft 相比之, 验证简化成了2个简单的比较,
+最终 Replication 请求的处理整体结构如下([`handle_replicate_req()`][]):
+
+```rust,ignore
+fn handle_replicate_req(&mut self, req: Request) -> Reply {
+
+    let is_granted   = vote > self.sto.vote;
+    let is_upto_date = req.last_log_id >= self.sto.last();
+
+    if is_granted && is_upto_date {
+        // ... to be continued below ...
+```
+
+如果 Replication 请求验证通过, 则把节点本地的 **时间** 和 **事件** 历史更新为请求中的值,
+其中时间更新是直接赋值, 事件历史更新是追加请求中的日志.
+跟标准的 Raft 一样, 确认请求中的日志跟本地是连续的之后, 才能追加:
+如果跟 Leader 发来的日志不一致, 则说明本地日志一定是 **未提交的**, 需要删除,
+等待 Leader 下次 Replication.
+
+```rust,ignore
+    if is_granted && is_upto_date {
+        // ... continued below ...
+        if self.sto.get_log_id(req.prev.index) == Some(req.prev) {
+            self.sto.append(req.logs);
+        } else {
+            self.sto.truncate(req.prev);
+        };
+    }
+}
+```
+
+最后, Follower 回复 Replication 请求处理的结果 `struct Reply`:
+
+- 其中 `granted` 表示请求是否被认为是合法的, 也就是验证 Leader 的时间(`vote`)和事件历史(`log`);
+- `vote` 表示 Follower 自己的时间;
+- `log` 表示 Follower 将请求中的 log 写到本地后的结果.
+    - 其中`Ok(LogId)` 表示成功接受了log, 并返回了已知的跟 Leader 对齐的最大log id.
+    - 而 `Err(u64)` 表示日志不连续无法接受, 并返回了 Follower 自己的最大log index+1, 告知 Leader 只需要在这个位置之前进行二分查找.
+
+```rust,ignore
+pub struct Reply {
+    granted: bool,
+    vote:    Vote,
+    log:     Result<LogId, u64>,
+}
+```
+
+one-file-raft 中所有处理 RPC 请求的代码仅以下17行 ([`handle_replicate_req()`][]):
+
+
+```rust,ignore
+pub fn handle_replicate_req(&mut self, req: Request) -> Reply {
+    let my_last = self.sto.last();
+    let (is_granted, vote) = self.check_vote(req.vote);
+    let is_upto_date = req.last_log_id >= my_last;
+
+    let req_last = req.logs.last().map(|x| x.log_id).unwrap_or(req.prev);
+
+    if is_granted && is_upto_date {
+        let log = if self.sto.get_log_id(req.prev.index) == Some(req.prev) {
+            self.sto.append(req.logs);
+            self.commit(min(req.commit, req_last.index));
+            Ok(req_last)
+        } else {
+            self.sto.truncate(req.prev);
+            Err(req.prev.index)
+        };
+
+        Reply { granted: true, vote, log }
+    } else {
+        Reply { granted: false, vote, log: Err(my_last.index + 1) }
+    }
+}
+```
+
+
 
 
 [`Vote`]: `crate::Vote`
@@ -381,6 +475,7 @@ let prev = (p.acked.index + p.len) / 2;
 [`Progress`]: `crate::Progress`
 [`Request`]: `crate::Request`
 [`send_if_idle()`]: `crate::Raft::send_if_idle`
+[`handle_replicate_req()`]: `crate::Raft::handle_replicate_req`
 
 [docs-LeaderId]: `crate::docs::tutorial_cn#leaderid`
 [docs-Vote]: `crate::docs::tutorial_cn#vote`

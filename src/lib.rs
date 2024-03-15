@@ -411,7 +411,6 @@ impl Raft {
         let l = self.leading.as_mut().unwrap();
 
         let p = l.progresses.get_mut(&target).unwrap();
-        trace!("send_if_idle: prog: N{}={:?}", target, p);
         p.ready.take()?;
 
         let prev = (p.acked.index + p.len) / 2;
@@ -422,6 +421,7 @@ impl Raft {
 
             prev: self.sto.get_log_id(prev).unwrap(),
             logs: self.sto.read_logs(prev + 1, n),
+
             commit: self.commit,
         };
 
