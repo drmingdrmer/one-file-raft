@@ -376,7 +376,7 @@ let prev = (p.acked.index + p.len) / 2;
 
 ### 2: Handle Replication Request
 
-one-file-raft 中所有处理 RPC 请求的代码仅以下17行 ([`handle_replicate_req()`][]):
+one-file-raft 中所有处理 RPC 请求的代码仅以下 21 行 ([`handle_replicate_req()`][]):
 
 ```rust,ignore
 pub fn handle_replicate_req(&mut self, req: Request) -> Reply {
@@ -400,6 +400,15 @@ pub fn handle_replicate_req(&mut self, req: Request) -> Reply {
     } else {
         Reply { granted: false, vote, log: Err(my_last.index + 1) }
     }
+}
+
+fn check_vote(&mut self, vote: Vote) -> (bool, Vote) {
+
+    if vote > self.sto.vote {
+        self.sto.vote = vote;
+    }
+
+    (vote == self.sto.vote, self.sto.vote)
 }
 ```
 

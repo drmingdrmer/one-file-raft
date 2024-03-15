@@ -467,7 +467,7 @@ The third step is to assemble a Replication RPC: [`Request`][].
 ### 2: Handle Replication Request
 
 All of the RPC request handling code in one-file-raft is contained within the
-following succinct 17 lines ([`handle_replicate_req()`][]):
+following succinct 21 lines ([`handle_replicate_req()`][]):
 
 ```rust,ignore
 pub fn handle_replicate_req(&mut self, req: Request) -> Reply {
@@ -491,6 +491,15 @@ pub fn handle_replicate_req(&mut self, req: Request) -> Reply {
     } else {
         Reply { granted: false, vote, log: Err(my_last.index + 1) }
     }
+}
+
+fn check_vote(&mut self, vote: Vote) -> (bool, Vote) {
+
+    if vote > self.sto.vote {
+        self.sto.vote = vote;
+    }
+
+    (vote == self.sto.vote, self.sto.vote)
 }
 ```
 
