@@ -482,12 +482,169 @@ pub struct Reply {
 ```
 
 
+### 3: Handle Replication Reply
+
+one-file-raft 中所有处理 RPC **应答**的代码在 ([`handle_replicate_reply()`][]) 函数内,
+它处理几件事情:
+
+- 1. 首先检查当前节点是否还是 Leader, 如果是直接返回;
+- 2. 检查请求是否被对端节点接受(granted), 即对端没有接受到其他更大 Leader 的请求, 当前 Leader 还是有效的;
+- 3. 更新 Leader 的选举状态;
+- 4. 更新到对端 Follower 节点的 log 复制进度;
+- 5. 更新 Leader 自己的 commit 位置.
+
+
+#### 3.1: 检查当前节点是否还是 Leader
+
+因为 one-file-raft 是异步的事件循环的模型, 有可能在发送请求后, Leader 已经被其他节点选中:
+`let l = self.leading.as_mut()?` 这一行, 如果当前节点是还是 `leading` 状态,
+则返回一个 `leading` 状态的引用, 否则直接返回 `None`.
+
+
+#### 3.2: 检查请求是否被接受(granted)
+
+前面提到, 对端节点接受一个 replication 请求的条件是: replication 发起者的**时间**(`vote`)和**事件历史**(`last-log-id`)都要比对端节点的大.
+因为对端节点返回它处理 replication 请求之后的 `vote`, 处理的方式是把本地的 `vote` 更新成较大值, 所以:
+- 只要对端返回的 `vote` 和自己的一样, 就说明对端接受了请求.
+- 如果对端返回的 `vote` 比自己的大, 则说明对端已经接受了一个更大的 Leader, 自己的 Leader 已经过时, 需要退位.
+- 如果对端返回的 `vote` 比自己的小, 则说明这是一个延迟到达的 replication  应答, 它由一个更早的Leader发出, 可以直接忽略;
+
+检查 replication 应答有效性的代码如下:
+
+```rust,ignore
+// let v = self.sto.vote;
+
+reply.vote.term == v.term
+    && reply.vote.voted_for == v.voted_for;
+```
+
+如果返回的 `vote` 跟自己不一样(只能是更大),
+ 则更新自己的 `vote`: `self.check_vote(reply.vote);`, 来实现 Leader 的退位: [`check_vote()`][].
+
+
+#### 3.3: 更新 Leader 的选举状态
+
+在 3.2 步骤通过后, 下一步是更新 Leader 的选举状态,
+也就是说是否集群中有一个 quorum 确认了这个 Leader 的**时间**(`vote`),
+quorum 确认 Leader 的 `vote` 后, 就可以保证其他在这个**时间**之前的 Leader 都不能复制 log 到一个 quorum,
+即无法完成commit,
+那么当前 Leader 就可以安全的 propose log 了.
+
+> 如果还有更小的 Leader 可以复制并 commit log, 那么这个 commit 的 log
+> 可能不会被下一个 Leader 选择,
+> 因为当前 Leader 有更大的 log-id(有更大 term 的log),
+> 导致 committed log 丢失.
+
+这时 Leader 把自己的**时间**(vote) 更新为 committed 的状态:
+```rust,ignore
+self.sto.vote.committed = Some(());
+```
+
+并直接 propose 一条空的 log, 这条空日志的目的是让**事件历史**更新到当前**时间**,
+因为 Raft 以 last-log-id 来表示**事件历史**的大小:
+最大**事件历史**会被下一个Leader选中, 从而保证了**事件历史**的连续性,
+也就是保证了**事件**不会丢失, 也就是保证了 commit 的条件.
+
+```rust,ignore
+// let l = self.leading.as_mut()?;
+
+l.granted_by.insert(target);
+
+if is_quorum(self.sto.config(), &l.granted_by) {
+    self.sto.vote.committed = Some(());
+
+    let (tx, _rx) = oneshot::channel();
+    self.net.send(self.id, self.id, Event::Write(tx, Log::default()));
+}
+```
+
+
+#### 3.4: 更新 log 复制进度
+
+replication 包括复制 Leader 的**时间**(`vote`)和Leader的**事件历史**(`logs`).
+上一步完成了**时间**(`vote`)的确认, 这一步完成 `log` 复制状态的更新.
+
+对端 Follower 节点可能返回2种日志复制状态:
+- `reply.log == Ok(LogId)`: 表示对端日志跟 replication 请求中的日志是连续的,
+  已经接受了 Leader 的日志, 并返回了已知的跟 Leader 对齐的最大log id;
+- `reply.log == Err(u64)`: 表示日志不连续无法接受,
+  并返回了对端 Follower 节点上已知的最大的, 跟 Leader 不一致的 log 的 index,
+  告知 Leader 只需要在这个位置之前进行二分查找.
+
+```rust,ignore
+// let l = self.leading.as_mut()?;
+
+let p = l.progresses.get_mut(&target).unwrap();
+
+*p = match reply.log {
+    Ok(acked) => Progress::new(acked, max(p.len, acked.index + 1), Some(())),
+    Err(len) => Progress::new(p.acked, min(p.len, len), Some(())),
+};
+```
+
+Leader 上为每个 Follower 维护一个进度[`Progress`][], 用来追踪每个 Follower 的复制进度.
+其中 `acked` 是最大的, 已经确认完成复制的 log-id, `len` 是远端 Follower 最小的跟 Leader 不一致的 log index:
+
+```rust,ignore
+pub struct Progress {
+    acked: LogId,
+    len: u64,
+    //...
+}
+```
+
+因此远端 Follower 上跟 Leader 一致的 log index 就在 `[acked.index, len)` 之间.
+每个 replication 请求都从这个范围的中点位置 `m` 作为发送的 log 的起始位置,
+并收到一个`Ok` 或 `Err` 应答, 然后将范围更新为`[acked.index, m)` 或 `[m, len)`.
+直到 `acked.index + 1 == len`.
+后续的仍然选择 `[acked.index, m)` 的中点作为起始, 就相当于直接从最后确认位置 `acked` 继续复制了.
+
+
+#### 3.5: 更新 Leader 的 commit 位置
+
+完成 log 复制状态的更新后, 最后一步是更新 Leader 的 commit 位置:
+即:
+1. 如果范围 `[0, i]` 内的 log 都已经复制到了一个 quorum 中, 那么就可以保证下一个 Leader 一定能看到这些log;
+2. 并且如果 `i` 位置的 log 肯定能被下一个 Leader 选择,
+   即 `logs[i].term` 一定是全局最大的.
+   即它只能是当前 Leader 的 `term`: `logs[i].term == self.sto.vote.term`.
+   在实现中, 我们是通过判断 `i` 是否比当前 Leader 的第一条`noop_log` 的 index 更大来判断的: `acked.index >= l.log_index_range.0`.
+
+如果满足上面这2个条件, 则说明 `[0,i]` 范围内的 log 已经不会丢失了, 即 committed.
+
+代码中我们寻找到最大的这样的 `i` 来更新 commit index:
+- 将所有 Follower 的最大的完成复制的 log id 按照降序排序;
+- 对排好序的每个 log id `acked`, 统计有几个 Follower 也至少复制到了这个位置;
+- 最后检查 `acked` 是否具有最大 `term`.
+
+```rust,ignore
+// Sort all acknowledged log id in desc order
+let acked_desc = l.progresses.values().map(|p| p.acked).sorted().rev();
+
+let mut max_committed = acked_desc.filter(|acked| {
+
+    // For each acknoledged log id `acked`,
+    // count the number of nodes that have acked log id >= `acked`.
+    let greater_equal = l.progresses.iter().filter(|(_id, p)| p.acked >= *acked);
+
+    // Whether `acked` has the greatest `term`
+    acked.index >= noop_index
+    &&
+    // And whether the number of nodes that have acked log id >= `acked` is a quorum,
+    is_quorum(self.sto.config(), greater_equal.map(|(id, _)| id))
+});
+```
+
+
 [`Vote`]: `crate::Vote`
 [`Leading`]: `crate::Leading`
 [`Progress`]: `crate::Progress`
 [`Request`]: `crate::Request`
+[`Progress`]: `crate::Progress`
 [`send_if_idle()`]: `crate::Raft::send_if_idle`
 [`handle_replicate_req()`]: `crate::Raft::handle_replicate_req`
+[`handle_replicate_reply()`]: `crate::Raft::handle_replicate_reply`
+[`check_vote()`]: `crate::Raft::check_vote`
 
 [docs-LeaderId]: `crate::docs::tutorial_cn#leaderid`
 [docs-Vote]: `crate::docs::tutorial_cn#vote`

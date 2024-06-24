@@ -440,7 +440,7 @@ impl Raft {
         }
     }
 
-    fn check_vote(&mut self, vote: Vote) -> (bool, Vote) {
+    pub fn check_vote(&mut self, vote: Vote) -> (bool, Vote) {
         trace!("N{} check_vote: my:{}, {}", self.id, self.sto.vote, vote);
 
         if vote > self.sto.vote {
