@@ -192,15 +192,15 @@ Raft (or other distributed consensus protocols) can be seen as consisting of two
 orthogonal and independent problems:
 
 - 1) Horizontally, it addresses how data is distributed across multiple nodes:
-  for example, how read-quorums and write-quorums are agreed upon to ensure
-  visibility between reads and writes, as well as membership changes, all of
-  which fall under this horizontal aspect.
+     for example, how read-quorums and write-quorums are agreed upon to ensure
+     visibility between reads and writes, as well as membership changes, all of
+     which fall under this horizontal aspect.
 
 - 2) Vertically, it primarily resolves the problem of ordering events. Here, two
-  concepts are introduced: **monotonic time** and the **monotonically increasing
-  history of events** that occur over this **monotonic time**. The design of
-  Raft's `Election` and `AppendEntries` mechanisms are aimed at solving these
-  issues.
+     concepts are introduced: **monotonic time** and the **monotonically increasing
+     history of events** that occur over this **monotonic time**. The design of
+     Raft's `Election` and `AppendEntries` mechanisms are aimed at solving these
+     issues.
 
 As we know that **there are no consensus issue in a single-threaded environment**,
 this is because there are some fundamental assumptions present in a
