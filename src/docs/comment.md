@@ -587,12 +587,249 @@ pub struct Reply {
 ```
 
 
+### 3: Handle Replication Reply
+
+The code for handling RPC **replies** in one-file-raft is within the [`handle_replicate_reply()`][] function.
+It handles several tasks:
+
+1. First, check if the current node is still the Leader; if not, return immediately;
+2. Check if the replication request was accepted (granted) by the remote node,
+   meaning the remote hasn't received requests from other larger Leaders,
+   thus the current Leader is still valid;
+3. Update the Leader's election status;
+4. Update the log replication progress for the remote Follower node;
+5. Update the Leader's commit position.
+
+
+#### 3.1: Check if the current node is still the Leader
+
+Because one-file-raft uses an asynchronous event loop model,
+it's possible that after sending a request, another node has been elected as Leader:
+In the line `let l = self.leading.as_mut()?`,
+if the current node is still in the `leading` state,
+returns a reference to the `leading` state,
+otherwise it returns `None` directly.
+
+
+#### 3.2: Check if the request was accepted (granted)
+
+As mentioned earlier, the condition for a remote node to accept a replication
+request is that the replication initiator's **time** (`vote`) and **event
+history** (`last-log-id`) must both be greater than those of the remote node.
+Because the remote node returns the updated `vote` when processing the replication
+request, by updating the local `vote` to the larger value, so:
+
+- If the `vote` returned by the remote is the same as the Leader, it means the
+  remote accepted the request.
+
+- If the `vote` returned by the remote is larger than the Leader, it means the
+  remote has accepted a larger Leader, and this Leader is outdated and needs
+  to step down.
+
+- If the `vote` returned by the remote is smaller than the Leader, it means this
+  is a delayed replication reply for an earlier Leader, which can be ignored
+  directly;
+
+The code to check the validity of the replication reply is as follows:
+
+```rust,ignore
+// let v = self.sto.vote;
+
+reply.vote.term == v.term
+    && reply.vote.voted_for == v.voted_for;
+```
+
+If the returned `vote` is different from its own (can only be larger),
+then update its own `vote`: `self.check_vote(reply.vote);`, to implement the
+Leader's abdication: [`check_vote()`][].
+
+
+#### 3.3: Update the Leader's election status
+
+After passing step 3.2, the next step is to update the Leader's election status,
+which means update the Leader's status about if a quorum has confirmed this Leader's **time** (`vote`).
+Once a quorum confirms the Leader's `vote`, it can be ensured that no other
+Leaders before this **time** can replicate logs to a quorum,
+meaning they cannot commit any log.
+Then the current Leader is legal to propose logs
+
+> if a smaller Leader could replicate and commit logs, then these committed logs
+> might not be chosen by the next Leader,
+> because the current Leader has a larger log-id (log with a larger term)),
+> which result in loss of committed log.
+
+At this point, the Leader updates its **time** (vote) to a committed status:
+```rust,ignore
+self.sto.vote.committed = Some(());
+```
+
+And then proposes a `noop` log.
+The purpose of this empty log is to update the **event history** to the current **time**,
+because Raft uses last-log-id to determine the order of the **event history**:
+The latest **event history** will be chosen by the next Leader,
+thus ensuring the continuity of the **event history**,
+which means ensuring that **events** will not be lost, which is the condition for commit.
+
+```rust,ignore
+// let l = self.leading.as_mut()?;
+
+l.granted_by.insert(target);
+
+if is_quorum(self.sto.config(), &l.granted_by) {
+    self.sto.vote.committed = Some(());
+
+    let (tx, _rx) = oneshot::channel();
+    self.net.send(self.id, self.id, Event::Write(tx, Log::default()));
+}
+```
+
+#### 3.4: Update log replication progress
+
+Replication includes replicating the Leader's **time** (`vote`) and the Leader's **event history** (`logs`).
+The previous step updates the replication status of **time** (`vote`), this step updates the  `log` replication status.
+
+The remote Follower node may return 2 types of log replication status:
+
+- `reply.log == Ok(LogId)`: Indicates that the log on the Follower is
+  consecutive with the log in the replication request,
+  and the Follower has accepted the Leader's log,
+  and has returned the largest known log id aligned with the Leader;
+
+- `reply.log == Err(u64)`: Indicates that the log on the Follower is
+  inconsistent and cannot be accepted,
+  and the Follower returns the known log index that is inconsistent with the Leader,
+  informing the Leader to shrink the binary search upto this position.
+
+```rust,ignore
+// let l = self.leading.as_mut()?;
+
+let p = l.progresses.get_mut(&target).unwrap();
+
+*p = match reply.log {
+    Ok(acked) => Progress::new(acked, max(p.len, acked.index + 1), Some(())),
+    Err(len) => Progress::new(p.acked, min(p.len, len), Some(())),
+};
+```
+
+The Leader maintains a progress [`Progress`][] for each Follower to track the
+replication progress of each Follower.
+In struct `Progress`, the field `acked` is the largest log-id that has been
+confirmed to be successfully replicated,
+`len` is the smallest log index on the remote Follower that is inconsistent with
+the Leader:
+
+```rust,ignore
+pub struct Progress {
+    acked: LogId,
+    len: u64,
+    //...
+}
+```
+
+The largest consistent log index on the remote Follower, compared to the Leader,
+falls between `[acked.index, len]`.
+
+Each replication request begins at the midpoint `m` of this range. This midpoint
+serves as the starting position for the log to be transmitted. The replication
+process then receives either an `Ok` or `Err` reply.
+Based on the reply, the range is updated:
+- If `Ok`: the new range becomes `[acked.index, m)`
+- If `Err`: the new range becomes `[m, len)`
+
+This process repeats until `acked.index + 1` equals `len`.
+
+For subsequent requests, the midpoint of `[acked.index, m)` is still chosen as
+the starting point. This is equivalent to continuing replication directly from
+the last confirmed position, `acked`.
+
+
+#### 3.5: Update the Leader's commit index
+
+After completing the update of the log replication status, the final step is to update the Leader's commit position:
+That is:
+1. If logs in the range `[0, i]` have been replicated to a quorum, then it can be guaranteed that the next Leader will definitely see these logs;
+2. And if the log at position `i` is certain to be chosen by the next Leader,
+   meaning `logs[i].term` must be the globally largest.
+   That is, it can only be the current Leader's `term`: `logs[i].term == self.sto.vote.term`.
+   In the implementation, we judge this by checking if `i` is larger than the index of the current Leader's first `noop_log`: `acked.index >= l.log_index_range.0`.
+
+If these two conditions are met, it means that logs in the range `[0,i]` will not be lost, i.e., they are committed.
+
+In the code, we find the largest such `i` to update the commit index:
+- Sort all the largest completed replicated log ids of all Followers in descending order;
+- For each sorted log id `acked`, count how many Followers have also replicated at least to this position;
+- Finally, check if `acked` has the largest `term`.
+
+```rust,ignore
+// Sort all acknowledged log id in desc order
+let acked_desc = l.progresses.values().map(|p| p.acked).sorted().rev();
+
+let mut max_committed = acked_desc.filter(|acked| {
+
+    // For each acknowledged log id `acked`,
+    // count the number of nodes that have acked log id >= `acked`.
+    let greater_equal = l.progresses.iter().filter(|(_id, p)| p.acked >= *acked);
+
+    // Whether `acked` has the greatest `term`
+    acked.index >= noop_index
+    &&
+    // And whether the number of nodes that have acked log id >= `acked` is a quorum,
+    is_quorum(self.sto.config(), greater_equal.map(|(id, _)| id))
+});
+```
+
+---
+
+After updating the log replication status, the final step is to update the
+Leader's commit index. This involves checking two key conditions:
+
+1. Quorum Replication: Logs in the range `[0, i]` must be replicated to a quorum. This ensures the next Leader will definitely see these logs.
+
+2. Term Consistency: The log at position `i` must be certain to be chosen by the
+   next Leader. This means `logs[i].term` must be the globally largest term,
+   which can only be the current Leader's term:
+   `logs[i].term == self.sto.vote.term`.
+   In practice, we verify this by checking if `i` is greater than the index of
+   the current Leader's first `noop_log`: `acked.index >= l.log_index_range.0`.
+
+When both conditions are met, we can be sure that logs in the range `[0,i]`
+won't be lost - in other words, they are committed.
+
+To update the commit index in the code, we find the largest such `i` through these steps:
+
+1. Sort the completed replicated log IDs of all Followers in descending order.
+2. For each sorted log ID `acked`, count how many Followers have replicated at least up to this index.
+3. Check if `acked` has the largest term.
+
+Here's the Rust code implementing this logic:
+
+```rust,ignore
+// Sort all acknowledged log IDs in descending order
+let acked_desc = l.progresses.values().map(|p| p.acked).sorted().rev();
+
+let mut max_committed = acked_desc.filter(|acked| {
+    // For each acknowledged log ID `acked`,
+    // count the number of nodes that have acked log ID >= `acked`.
+    let greater_equal = l.progresses.iter().filter(|(_id, p)| p.acked >= *acked);
+
+    // Check if `acked` has the greatest term
+    acked.index >= noop_index
+    &&
+    // And if the number of nodes that have acked log ID >= `acked` forms a quorum
+    is_quorum(self.sto.config(), greater_equal.map(|(id, _)| id))
+});
+```
+
+
 [`Vote`]: `crate::Vote`
 [`Leading`]: `crate::Leading`
 [`Progress`]: `crate::Progress`
 [`Request`]: `crate::Request`
+[`Progress`]: `crate::Progress`
 [`send_if_idle()`]: `crate::Raft::send_if_idle`
 [`handle_replicate_req()`]: `crate::Raft::handle_replicate_req`
+[`handle_replicate_reply()`]: `crate::Raft::handle_replicate_reply`
+[`check_vote()`]: `crate::Raft::check_vote`
 
 [docs-LeaderId]: `crate::docs::tutorial#leaderid`
 [docs-Vote]: `crate::docs::tutorial#vote`
