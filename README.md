@@ -1,4 +1,4 @@
-# one_file_raft
+# one-file-raft
 
 This is a concise, demonstrative implementation of the Raft consensus algorithm
 contained within a single Rust file, approximately 300 lines in length.
@@ -13,7 +13,7 @@ log compaction and log purging.
 
 ```shell
 ./loc.sh
-     302
+     300
 ```
 
 For a production use of Raft, refer to [Openraft](https://github.com/datafuselabs/openraft)
